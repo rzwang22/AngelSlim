@@ -404,11 +404,32 @@ def test_final_trace_describes_full_verification_before_budget_or_eos_truncation
         assert len(writer.records) == 1
 
 
-@pytest.mark.parametrize("trace_enabled,prob_stats", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "trace_enabled,prob_stats,route,custom_layers",
+    [
+        (False, False, None, None),
+        (False, True, None, None),
+        (True, True, None, None),
+        (True, True, "deep", None),
+        (True, True, "shallow", "5,21,33"),
+        (True, True, None, "5,21,33"),
+        (False, False, "spread", None),
+    ],
+)
 def test_main_plumbs_selected_sample_turn_rank_and_metadata(
-    benchmark, monkeypatch, tmp_path, trace_enabled, prob_stats
+    benchmark, monkeypatch, tmp_path, trace_enabled, prob_stats, route, custom_layers
 ):
     dataset_events, generation_calls, conversations = [], [], []
+    route_calls = []
+    bank = [1, 5, 9, 13, 17, 21, 25, 29, 33]
+    effective_route = "custom" if custom_layers else route or "original"
+    active_ids = {
+        "original": bank,
+        "deep": [25, 29, 33],
+        "spread": [1, 17, 33],
+        "custom": [5, 21, 33],
+    }[effective_route]
+    route_context = {"target_route": effective_route, "active_target_layer_ids": active_ids}
 
     class Dataset:
         def __init__(self, rows):
@@ -432,7 +453,7 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
         device = torch.device("cpu")
         block_size = 4
         mask_token_id = 0
-        target_layer_ids = [1, 3]
+        target_layer_ids = bank
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -443,6 +464,9 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
 
         def eval(self):
             return self
+
+        def set_target_layer_route(self, active_layer_ids):
+            route_calls.append(list(active_layer_ids))
 
     class Tokenizer:
         eos_token_id = 6
@@ -508,10 +532,15 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
         argv += ["--trace-output", str(trace_path)]
     if prob_stats:
         argv += ["--trace-prob-stats"]
+    if route:
+        argv += ["--target-route", route]
+    if custom_layers:
+        argv += ["--target-route-layers", custom_layers]
     monkeypatch.setattr(sys, "argv", argv)
     benchmark.main()
 
     assert dataset_events == [("shuffle", 0), ("select", [0, 1, 2])]
+    assert route_calls == ([] if effective_route == "original" else [active_ids])
     assert [call["block_size"] for call in generation_calls] == [1, 4, 1, 4]
     assert conversations[0] == [{"role": "user", "content": "sample3-turn0"}]
     assert conversations[1][-2:] == [
@@ -521,7 +550,7 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
     for index, call in enumerate(generation_calls):
         assert call["trace_prob_stats"] is prob_stats
         if trace_enabled and call["block_size"] > 1:
-            assert call["trace_context"] == {"sample_id": 1, "turn_id": index // 2}
+            assert call["trace_context"] == dict(sample_id=1, turn_id=index // 2, **route_context)
             assert call["trace_writer"] is not None
         else:
             assert call["trace_context"] is None
@@ -529,8 +558,8 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
     if trace_enabled:
         rank_path = tmp_path / "trace.rank1.jsonl"
         assert [json.loads(line) for line in rank_path.read_text().splitlines()] == [
-            {"sample_id": 1, "turn_id": 0, "round_id": 0},
-            {"sample_id": 1, "turn_id": 1, "round_id": 0},
+            dict(sample_id=1, turn_id=0, round_id=0, **route_context),
+            dict(sample_id=1, turn_id=1, round_id=0, **route_context),
         ]
         metadata = json.loads(Path(str(rank_path) + ".meta.json").read_text())
         for key, value in {
@@ -541,7 +570,8 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
             "temperature": 0.0,
             "draft_arch": "dflare",
             "block_size": 4,
-            "target_layer_ids": [1, 3],
+            "target_layer_ids": bank,
+            **route_context,
             "model_name_or_path": "fake-target",
             "draft_name_or_path": "fake-draft",
             "trace_prob_stats": True,

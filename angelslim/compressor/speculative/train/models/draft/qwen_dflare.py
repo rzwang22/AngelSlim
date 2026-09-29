@@ -283,6 +283,8 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         self.layer_fusion_weights = nn.Parameter(
             torch.empty(self.num_draft_layers, self.num_target_layers)
         )
+        # Inference intervention only; never serialized or added to the config.
+        self.register_buffer("_target_route_mask", None, persistent=False)
         self._init_fusion_weights()
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
@@ -297,6 +299,33 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
                 int((d_idx / self.num_draft_layers) * self.num_target_layers),
             )
             self.layer_fusion_weights.data[d_idx, t_idx] = 2.0
+
+    def set_target_layer_route(self, active_layer_ids: Optional[List[int]] = None) -> None:
+        """Select available target sources by layer ID; None restores the original path.
+
+        All draft layers share availability, but retain their own learned logits.
+        The captured layer bank, fusion parameters and checkpoint stay unchanged.
+        """
+        if active_layer_ids is None:
+            self._target_route_mask = None
+            return
+        if self.training:
+            raise RuntimeError("Target-layer routing is inference-only; call eval() first.")
+        active_layer_ids = list(active_layer_ids)
+        if not active_layer_ids:
+            raise ValueError("Target-layer route must not be empty.")
+        if any(type(layer_id) is not int or layer_id < 0 for layer_id in active_layer_ids):
+            raise ValueError("Target-layer route must contain nonnegative integer layer IDs.")
+        if len(set(active_layer_ids)) != len(active_layer_ids):
+            raise ValueError("Target-layer route must not contain duplicate layer IDs.")
+        for layer_id in active_layer_ids:
+            if layer_id not in self.target_layer_ids:
+                raise ValueError(f"{layer_id} is not in checkpoint target_layer_ids.")
+        self._target_route_mask = torch.tensor(
+            [layer_id in active_layer_ids for layer_id in self.target_layer_ids],
+            dtype=torch.bool,
+            device=self.layer_fusion_weights.device,
+        )
 
     def forward(
         self,
@@ -315,7 +344,15 @@ class QwenDFlareDraftModel(Qwen3PreTrainedModel):
         target_hidden_reshaped = target_hidden.view(
             bsz, seq_len, self.num_target_layers, self.config.hidden_size
         )
-        fusion_probs = torch.softmax(self.layer_fusion_weights, dim=1)
+        if self._target_route_mask is None:
+            fusion_probs = torch.softmax(self.layer_fusion_weights, dim=1)
+        else:
+            if self.training:
+                raise RuntimeError("Target-layer routing is inference-only; call eval() first.")
+            fusion_probs = torch.softmax(
+                self.layer_fusion_weights.masked_fill(~self._target_route_mask, float("-inf")),
+                dim=1,
+            )
         # bsth (target) x dt (per-draft-layer fusion) -> bsdh (per-draft-layer)
         fused_hidden = torch.einsum("bsth,dt->bsdh", target_hidden_reshaped, fusion_probs)
         fused_hidden = self.hidden_norm(fused_hidden)

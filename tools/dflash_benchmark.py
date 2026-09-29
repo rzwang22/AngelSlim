@@ -98,6 +98,66 @@ def _dist_gather(obj: Any, dst: int = 0) -> Optional[List[Any]]:
     return None
 
 
+# These are source layer IDs, not positions or percentiles in a checkpoint bank.
+# Other checkpoints must contain the requested IDs, or use a custom route.
+TARGET_ROUTES = {
+    "shallow": [1, 5, 9],
+    "middle": [13, 17, 21],
+    "deep": [25, 29, 33],
+    "spread": [1, 17, 33],
+    "mid_deep": [17, 25, 33],
+}
+
+
+def _parse_target_route_layers(value):
+    try:
+        layers = [int(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Target route must be a nonempty comma-separated list of integer layer IDs."
+        ) from exc
+    if len(set(layers)) != len(layers):
+        raise argparse.ArgumentTypeError("Target route must not contain duplicate layer IDs.")
+    return layers
+
+
+def _resolve_target_route(
+    target_layer_ids, target_route="original", target_route_layers=None, draft_arch="dflare"
+):
+    """Validate against the actual checkpoint bank; return name and IDs in bank order."""
+    if target_route_layers is not None:
+        target_route = "custom"
+    if target_route != "original" and draft_arch != "dflare":
+        raise ValueError("target-layer routing is currently supported only for DFlare")
+    bank = list(target_layer_ids)
+    if target_route == "original":
+        # Preserve existing banks, including repeated IDs from the model's fallback.
+        return target_route, bank
+    if not bank or any(type(layer_id) is not int or layer_id < 0 for layer_id in bank):
+        raise ValueError("Checkpoint target_layer_ids must be nonempty nonnegative integer IDs.")
+    if len(set(bank)) != len(bank):
+        raise ValueError("Checkpoint target_layer_ids must not contain duplicate layer IDs.")
+    if target_route == "custom":
+        if not target_route_layers:
+            raise ValueError("Custom target route requires nonempty --target-route-layers.")
+        active_ids = list(target_route_layers)
+    elif target_route in TARGET_ROUTES:
+        active_ids = TARGET_ROUTES[target_route]
+    else:
+        raise ValueError(f"Unknown target route: {target_route}")
+    if any(type(layer_id) is not int or layer_id < 0 for layer_id in active_ids):
+        raise ValueError("Target route must contain nonnegative integer layer IDs.")
+    if len(set(active_ids)) != len(active_ids):
+        raise ValueError("Target route must not contain duplicate layer IDs.")
+    for layer_id in active_ids:
+        if layer_id not in bank:
+            raise ValueError(
+                f"{layer_id} is not in checkpoint target_layer_ids {bank}. "
+                "Use --target-route-layers with IDs from this bank."
+            )
+    return target_route, [layer_id for layer_id in bank if layer_id in active_ids]
+
+
 # ---------------------------------------------------------------------------
 # Opt-in verification tracing. Only reduced statistics and token IDs leave the
 # device; no model/cache tensors are retained by the writer.
@@ -143,7 +203,7 @@ def _build_verification_trace(
     draft_tokens = block_tokens[1:]
     target_tokens = posterior[0, :-1].tolist()
     all_accepted = accepted_draft_tokens == len(draft_tokens)
-    return {
+    record = {
         "sample_id": trace_context["sample_id"],
         "turn_id": trace_context["turn_id"],
         "round_id": round_id,
@@ -162,6 +222,11 @@ def _build_verification_trace(
         "first_reject_position": None if all_accepted else accepted_draft_tokens,
         "all_draft_tokens_accepted": all_accepted,
     }
+    # Preserve compatibility with callers that only supply sample/turn identity.
+    for key in ("target_route", "active_target_layer_ids"):
+        if key in trace_context:
+            record[key] = trace_context[key]
+    return record
 
 
 def _trace_probability_stats(draft_logits, target_logits, draft_token_ids):
@@ -537,7 +602,25 @@ def main() -> None:
         action="store_true",
         help="Include raw-distribution logprobs/entropies; only effective with --trace-output.",
     )
+    parser.add_argument(
+        "--target-route",
+        choices=["original", *TARGET_ROUTES, "custom"],
+        default="original",
+        help="Fixed DFlare source-layer route for the entire run (default: original, no mask).",
+    )
+    parser.add_argument(
+        "--target-route-layers",
+        type=_parse_target_route_layers,
+        default=None,
+        help="Comma-separated source layer IDs; overrides --target-route and selects custom.",
+    )
     args = parser.parse_args()
+    if args.target_route == "custom" and args.target_route_layers is None:
+        parser.error("--target-route custom requires --target-route-layers.")
+    if args.draft_arch != "dflare" and (
+        args.target_route != "original" or args.target_route_layers is not None
+    ):
+        parser.error("target-layer routing is currently supported only for DFlare")
 
     random.seed(0)
     np.random.seed(0)
@@ -588,6 +671,26 @@ def main() -> None:
         .eval()
     )
 
+    try:
+        target_route, active_target_layer_ids = _resolve_target_route(
+            draft_model.target_layer_ids,
+            args.target_route,
+            args.target_route_layers,
+            args.draft_arch,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if target_route != "original":
+        draft_model.set_target_layer_route(active_target_layer_ids)
+    if args.draft_arch == "dflare" and _dist_is_main():
+        print(f"Target layer bank: {draft_model.target_layer_ids}")
+        print(f"Target route: {target_route}")
+        print(f"Active target layers: {active_target_layer_ids}")
+    route_info = {
+        "target_route": target_route,
+        "active_target_layer_ids": active_target_layer_ids,
+    }
+
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -621,6 +724,7 @@ def main() -> None:
                         "draft_name_or_path": args.draft_name_or_path,
                         "trace_prob_stats": args.trace_prob_stats,
                         "probability_distribution": "raw_logits_softmax",
+                        **route_info,
                     },
                 )
             )
@@ -649,7 +753,7 @@ def main() -> None:
                         temperature=args.temperature,
                         trace_writer=trace_writer if bs > 1 else None,
                         trace_context=(
-                            {"sample_id": idx, "turn_id": turn_id}
+                            {"sample_id": idx, "turn_id": turn_id, **route_info}
                             if trace_writer is not None and bs > 1
                             else None
                         ),

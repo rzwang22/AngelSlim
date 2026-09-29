@@ -92,6 +92,47 @@ Notes:
 - Supported datasets out of the box: `gsm8k`, `math500`, `aime24`, `aime25`, `alpaca`, `mt-bench`, `humaneval`, `mbpp`, `lbpp`, `swe-bench`, `livecodebench`.
 - To compare DFlash and DFlare on the same checkpoint format, switch `--draft-arch dflash` and point `--draft-name-or-path` to a DFlash checkpoint — the rest of the command stays identical.
 
+### Static Target-Layer Routes
+
+For inference diagnostics, `--target-route` selects one fixed set of target source layers for the entire benchmark run. The default `original` preserves the checkpoint's fusion behavior. Other routes require `--draft-arch dflare` and mask the learned DFlare fusion to measure acceptance sensitivity without retraining.
+
+The benchmark reads the actual target layer bank from the loaded draft model, honoring the checkpoint's `dflash_config.target_layer_ids`. For the Qwen3-8B DFlare checkpoint with bank `[1, 5, 9, 13, 17, 21, 25, 29, 33]`, the routes are:
+
+| Route | Active target layer IDs |
+| --- | --- |
+| `original` | Full runtime checkpoint bank |
+| `shallow` | `[1, 5, 9]` |
+| `middle` | `[13, 17, 21]` |
+| `deep` | `[25, 29, 33]` |
+| `spread` | `[1, 17, 33]` |
+| `mid_deep` | `[17, 25, 33]` |
+| `custom` | IDs supplied by `--target-route-layers` |
+
+Preset IDs are fixed, not recalculated as depth percentiles for other checkpoints. Every requested ID must belong to the runtime bank; missing IDs and empty routes fail before evaluation. Use a custom route for a different bank. Layer IDs map to their positions in that bank: for example, `[1, 17, 33]` produces mask `[1, 0, 0, 0, 1, 0, 0, 0, 1]` for the bank above. After loading the model, the main rank prints the bank, effective route, and active layers once.
+
+Example with a deep route and verification tracing:
+
+```shell
+python tools/dflash_benchmark.py \
+    --model-name-or-path /path/to/Qwen3-8B \
+    --draft-name-or-path /path/to/dflare_checkpoint \
+    --draft-arch dflare --dataset gsm8k --max-samples 8 \
+    --temperature 0.0 --target-route deep \
+    --trace-output /path/to/deep.jsonl
+```
+
+For custom layers, replace `--target-route deep` with `--target-route custom --target-route-layers 5,21,33`, or simply `--target-route-layers 5,21,33`. Providing `--target-route-layers` always takes precedence over the selected route name and records the effective route as `custom`; for example, `--target-route deep --target-route-layers 5,21,33` also selects `[5, 21, 33]`. Selecting `custom` without supplying layers is an error. Non-original routes on other draft architectures are rejected.
+
+The implementation is in `angelslim/compressor/speculative/train/models/draft/qwen_dflare.py`. `extract_context_feature()` concatenates `hidden_states[layer_id + 1]` for each bank ID, accounting for the embedding output at index 0. `QwenDFlareDraftModel.forward()` reshapes this into the target layer bank and treats `layer_fusion_weights[d, l]` as learned logits `W[d, l]`, where `l` indexes the bank. `set_target_layer_route()` installs an inference-only, nonpersistent source-layer mask shared by all draft layers. Fusion is:
+
+```text
+W_route[d, l] = W[d, l] if target_layer_ids[l] is active, else -inf
+alpha_route[d, :] = softmax(W_route[d, :])
+fused_hidden[b, s, d, h] = sum_l alpha_route[d, l] * target_hidden[b, s, l, h]
+```
+
+Each draft layer retains its own learned relative weights among active sources. After `hidden_norm` RMS normalization, its fused context enters that layer's cross-attention through `k_proj_target` and `v_proj_target`. For `original`, the mask is `None` and `forward()` uses the original `softmax(layer_fusion_weights, dim=1)` path directly. The intervention leaves the target forward and full target hidden-state capture intact; it changes neither checkpoint weights, state-dict keys, nor the configured bank. It measures route sensitivity, not target compute savings, and does not change routes between rounds.
+
 ### Optional Verification Trace
 
 Add `--trace-output /path/to/verification.jsonl` to either evaluation command to stream one JSON object per speculative round. Add `--trace-prob-stats` to also record per-proposal probabilities and entropies. Tracing is disabled by default: without `--trace-output`, no trace files or extra probability calculations are produced, and `--trace-prob-stats` has no effect. The `block_size=1` AR baseline is never traced.
@@ -101,6 +142,7 @@ For a verified block of size `B`, position 0 is an already sampled anchor; the d
 | Fields | Meaning |
 | --- | --- |
 | `sample_id`, `turn_id`, `round_id` | Zero-based sample index after the benchmark's optional shuffle/select, before rank sharding; turn index within that sample; round index reset to 0 for each generation call. |
+| `target_route`, `active_target_layer_ids` | Effective fixed route name and active target layer IDs. `original` records the full runtime bank; explicit layer IDs record route `custom`. |
 | `num_input_tokens`, `round_start`, `generated_tokens_before_round` | Prompt length; absolute token index of the current anchor; `round_start - num_input_tokens`, counting generated tokens before the anchor and excluding the anchor itself. |
 | `block_size`, `proposal_count` | `B` and `B - 1`. |
 | `anchor_token_id`, `draft_token_ids` | The anchor at block position 0 and the `B - 1` draft proposal IDs at positions 1 through `B - 1`. |
@@ -118,9 +160,9 @@ Proposal `x_k = block_output_ids[:, k + 1]` aligns with `draft_logits[:, k]` and
 
 Each record describes the complete verified block before EOS or output-length truncation. Thus acceptance fields preserve the benchmark's per-round metric even when the returned generation ends partway through the final block.
 
-On a single GPU, the writer uses the requested path directly. Under `torchrun`, `verification.jsonl` becomes `verification.rank0.jsonl`, `verification.rank1.jsonl`, and so on. Parent directories are created automatically; each JSONL line is flushed through line buffering. A companion `<resolved-trace-path>.meta.json` records benchmark settings, model paths, block size, target layer IDs, probability-statistics setting, rank, and world size.
+On a single GPU, the writer uses the requested path directly. Under `torchrun`, `verification.jsonl` becomes `verification.rank0.jsonl`, `verification.rank1.jsonl`, and so on. Parent directories are created automatically; each JSONL line is flushed through line buffering. A companion `<resolved-trace-path>.meta.json` records benchmark settings, model paths, block size, target layer IDs, probability-statistics setting, rank, and world size. Both metadata and every benchmark trace record include `target_route` and `active_target_layer_ids`.
 
-Trace collection adds device-to-host transfers and file writes inside the timed decoding loop, with additional computation when probability statistics are enabled. Use runs with tracing disabled for baseline speed comparisons. Tracing does not change sampling, acceptance, cache updates, target-layer fusion, or generation output.
+Trace collection adds device-to-host transfers and file writes inside the timed decoding loop, with additional computation when probability statistics are enabled. Use runs with tracing disabled for baseline speed comparisons. For any selected route, enabling trace collection leaves sampling, acceptance, cache updates, fusion, and generation output unchanged. Selecting a non-original route is a separate intervention that changes draft fusion and may change proposals and acceptance.
 
 
 ## 📈 Results
