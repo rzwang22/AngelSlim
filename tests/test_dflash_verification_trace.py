@@ -548,6 +548,7 @@ def test_main_plumbs_selected_sample_turn_rank_and_metadata(
         {"role": "user", "content": "sample3-turn1"},
     ]
     for index, call in enumerate(generation_calls):
+        assert "state_writer" not in call
         assert call["trace_prob_stats"] is prob_stats
         if trace_enabled and call["block_size"] > 1:
             assert call["trace_context"] == dict(sample_id=1, turn_id=index // 2, **route_context)

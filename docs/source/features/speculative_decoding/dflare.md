@@ -164,6 +164,56 @@ On a single GPU, the writer uses the requested path directly. Under `torchrun`, 
 
 Trace collection adds device-to-host transfers and file writes inside the timed decoding loop, with additional computation when probability statistics are enabled. Use runs with tracing disabled for baseline speed comparisons. For any selected route, enabling trace collection leaves sampling, acceptance, cache updates, fusion, and generation output unchanged. Selecting a non-original route is a separate intervention that changes draft fusion and may change proposals and acceptance.
 
+### Same-State Counterfactual Route Evaluation
+
+P3 measures one drafting-and-verification round under several routes at each state of a canonical `original` trajectory. Candidate results never advance that trajectory. Both capture and replay require DFlare, `original` as the canonical route, and exactly `temperature=0`.
+
+First capture canonical states during a normal benchmark run:
+
+```shell
+python tools/dflash_benchmark.py \
+    --model-name-or-path /path/to/Qwen3-8B \
+    --draft-name-or-path /path/to/dflare_checkpoint \
+    --draft-arch dflare --dataset gsm8k --max-samples 8 \
+    --max-new-tokens 2048 --temperature 0 --target-route original \
+    --state-output experiments/oracle/gsm8k_8_states.jsonl
+```
+
+`--trace-output` can be used simultaneously. State capture uses the same streaming JSONL writer and companion `.meta.json` convention as P1, including separate rank files under `torchrun`. Only speculative rounds are captured. The manifest records the exact prefix, sample/turn/round identity, prompt length, round and cache boundaries, canonical draft/target proposal IDs, acceptance counts, block size, generation limits, mask/stop IDs, temperature, and target layer bank. Metadata records the model paths and attention implementation; keep the manifest and its metadata together for replay. No hidden-state, KV-cache, or full-logit tensors are saved.
+
+Here the prefix includes the already sampled anchor. At round start `s`, `canonical_prefix_token_ids` contains positions `[0, s]`, so its length is `s + 1`; `generated_tokens_before_round` remains `s - num_input_tokens`, excluding the anchor. The target cache contains `[0, s)`. The draft cache contains `[0, p)`, where `p` is the previous round's start (zero for the first round), and the newly supplied target hidden states cover `[p, s)`.
+
+This draft history matters: each draft call appends context KV followed by noise KV, then `crop(start)` removes the noise KV. The remaining historical context was fused under `original`. Prefilling the entire prefix under a restricted route would change that history. P3 therefore rebuilds every candidate's state with fresh target/draft caches and token buffers: it prefills the original prompt, replays preceding canonical rounds under `original`, checks the reconstructed prefix and cache boundaries, and only then switches the route for one measured round. It preserves the canonical forward boundaries as well as the tokens. Unlike a P2 static-route run, a P3 intervention retains the original-conditioned historical draft cache and changes fusion of the current context segment.
+
+Replay a small subset first, using the same model paths and attention backend as capture:
+
+```shell
+python tools/dflash_benchmark.py \
+    --model-name-or-path /path/to/Qwen3-8B \
+    --draft-name-or-path /path/to/dflare_checkpoint \
+    --draft-arch dflare --temperature 0 \
+    --counterfactual-state-input experiments/oracle/gsm8k_8_states.jsonl \
+    --counterfactual-output experiments/oracle/gsm8k_8_oracle.jsonl \
+    --counterfactual-routes original,shallow,middle,deep,spread,mid_deep \
+    --counterfactual-max-states 32
+```
+
+The six routes shown are the default; `original` must be included. `--dataset` is unnecessary for replay. Omit `--counterfactual-max-states` to evaluate all saved states, or use `--counterfactual-state-start` to skip an initial number of states. Replay currently runs in one process; replay each captured rank file separately and combine the resulting files during analysis. A progress bar shows state progress and the current sample/round.
+
+For every state, replayed `original` draft IDs, target proposal IDs, and accepted length must match the canonical record exactly. A reconstruction or replay mismatch aborts evaluation; a failed run has no valid oracle summary. Each successful JSONL record contains sample/turn/round IDs, prefix length, canonical route and acceptance, `original_replay_matches: true`, and a `route_results` entry for each candidate with `accepted_draft_tokens`, `reported_acceptance_length`, and proposal token IDs. Candidate caches are never reused across routes, and the route mask is restored to `original` before each reconstruction. P3 does not compute probability statistics.
+
+Analyze one or more oracle files with:
+
+```shell
+python tools/analyze_dflare_route_oracle.py \
+    experiments/oracle/gsm8k_8_oracle.jsonl \
+    --json-output experiments/oracle/gsm8k_8_summary.json
+```
+
+All analysis uses accepted draft tokens, excluding the anchor. With `A[r,c]` denoting route `c`'s acceptance at canonical state `r`, the best static mean is `max_c mean_r A[r,c]`, and the oracle mean is `mean_r max_c A[r,c]`. The report includes per-route means, absolute/relative oracle gains over best static and original, unique-win and max-or-tied fractions, original optimality, and whether any restricted route beats or matches original or all are worse. Per restricted route, it also reports the fractions matching original, within one accepted token below original or better, and strictly beating original. Tied maxima count for every tied route; unique wins require a sole winner.
+
+These are measurements on the selected canonical states, not throughput predictions or a rollout of a dynamic policy. State capture adds overhead, and replay repeats prior original rounds for every state and candidate, so it can be much slower than ordinary generation. Without the P3 flags, the existing P1/P2 benchmark paths remain unchanged.
+
 
 ## 📈 Results
 
