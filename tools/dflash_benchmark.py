@@ -32,11 +32,14 @@ Usage (8 GPUs)::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import time
 import warnings
+from contextlib import ExitStack
 from itertools import chain
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
@@ -93,6 +96,97 @@ def _dist_gather(obj: Any, dst: int = 0) -> Optional[List[Any]]:
         return objs
     torch_dist.gather_object(obj, dst=dst)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Opt-in verification tracing. Only reduced statistics and token IDs leave the
+# device; no model/cache tensors are retained by the writer.
+# ---------------------------------------------------------------------------
+class VerificationTraceWriter:
+    """Stream one JSON object per round, flushing each line (without fsync)."""
+
+    def __init__(self, path, *, rank=0, world_size=1, metadata=None):
+        self.path = Path(path)
+        if world_size > 1:
+            name = self.path.stem if self.path.suffix == ".jsonl" else self.path.name
+            self.path = self.path.with_name(f"{name}.rank{rank}.jsonl")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if metadata is not None:
+            metadata = dict(metadata, rank=rank, world_size=world_size)
+            Path(str(self.path) + ".meta.json").write_text(
+                json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+            )
+        self._file = self.path.open("w", encoding="utf-8", buffering=1)
+
+    def write(self, record):
+        self._file.write(json.dumps(record, allow_nan=False) + "\n")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._file.close()
+
+
+def _build_verification_trace(
+    *,
+    trace_context,
+    round_id,
+    num_input_tokens,
+    round_start,
+    block_output_ids,
+    posterior,
+    accepted_draft_tokens,
+):
+    """Describe the full verified block, before EOS/length output truncation."""
+    block_tokens = block_output_ids[0].tolist()
+    draft_tokens = block_tokens[1:]
+    target_tokens = posterior[0, :-1].tolist()
+    all_accepted = accepted_draft_tokens == len(draft_tokens)
+    return {
+        "sample_id": trace_context["sample_id"],
+        "turn_id": trace_context["turn_id"],
+        "round_id": round_id,
+        "num_input_tokens": num_input_tokens,
+        "round_start": round_start,
+        # Counts the committed prefix, excluding this round's sampled anchor.
+        "generated_tokens_before_round": round_start - num_input_tokens,
+        "block_size": len(block_tokens),
+        "proposal_count": len(draft_tokens),
+        "anchor_token_id": block_tokens[0],
+        "draft_token_ids": draft_tokens,
+        "target_token_ids_for_proposals": target_tokens,
+        "match_mask": [draft == target for draft, target in zip(draft_tokens, target_tokens)],
+        "accepted_draft_tokens": accepted_draft_tokens,
+        "reported_acceptance_length": accepted_draft_tokens + 1,
+        "first_reject_position": None if all_accepted else accepted_draft_tokens,
+        "all_draft_tokens_accepted": all_accepted,
+    }
+
+
+def _trace_probability_stats(draft_logits, target_logits, draft_token_ids):
+    """Aligned proposal positions; raw model distributions, natural logs/nats.
+
+    Both logits have shape [1, proposal_count, vocab_size]. Target probabilities
+    are gathered for the *draft's* proposed tokens, including rejected proposals.
+    Reductions stay on-device in float32; only per-position scalars reach CPU.
+    """
+
+    def reduce_logits(logits):
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        proposed_logprobs = logprobs.gather(-1, draft_token_ids.unsqueeze(-1)).squeeze(-1)
+        entropies = torch.special.entr(logprobs.exp()).sum(dim=-1)
+        return proposed_logprobs, entropies
+
+    draft_logprobs, draft_entropies = reduce_logits(draft_logits)
+    target_logprobs, target_entropies = reduce_logits(target_logits)
+    return {
+        "draft_logprobs": draft_logprobs[0].tolist(),
+        "target_logprobs": target_logprobs[0].tolist(),
+        "logprob_gaps": (target_logprobs - draft_logprobs)[0].tolist(),
+        "draft_entropies": draft_entropies[0].tolist(),
+        "target_entropies": target_entropies[0].tolist(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +347,14 @@ def dflash_generate(
     sample_fn,
     extract_context_feature_fn,
     temperature: float = 0.0,
+    trace_writer=None,
+    trace_context=None,
+    trace_prob_stats: bool = False,
 ) -> SimpleNamespace:
+    """Generate as before; tracing requires a context with sample_id/turn_id."""
+    if trace_writer is not None and block_size > 1:
+        if trace_context is None or not {"sample_id", "turn_id"} <= trace_context.keys():
+            raise ValueError("Speculative tracing requires sample_id and turn_id.")
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
@@ -326,6 +427,24 @@ def dflash_generate(
         acceptance_length = (
             (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         )
+        if trace_writer is not None and block_size > 1:
+            record = _build_verification_trace(
+                trace_context=trace_context,
+                round_id=len(acceptance_lengths),
+                num_input_tokens=num_input_tokens,
+                round_start=start,
+                block_output_ids=block_output_ids,
+                posterior=posterior,
+                accepted_draft_tokens=acceptance_length,
+            )
+            if trace_prob_stats:
+                # Target logit k predicts block token k+1, the draft proposal k.
+                record.update(
+                    _trace_probability_stats(
+                        draft_logits, output.logits[:, :-1, :], block_output_ids[:, 1:]
+                    )
+                )
+            trace_writer.write(record)
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
             :, : acceptance_length + 1
         ]
@@ -404,6 +523,20 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--trace-output",
+        type=str,
+        default=None,
+        help=(
+            "Stream speculative rounds to JSONL "
+            "(disabled by default; per-rank files under torchrun)."
+        ),
+    )
+    parser.add_argument(
+        "--trace-prob-stats",
+        action="store_true",
+        help="Include raw-distribution logprobs/entropies; only effective with --trace-output.",
+    )
     args = parser.parse_args()
 
     random.seed(0)
@@ -465,36 +598,69 @@ def main() -> None:
 
     responses = []
     indices = range(_dist_rank(), len(dataset), _dist_size())
-    for idx in tqdm(indices, disable=not _dist_is_main()):
-        instance = dataset[idx]
-        messages = []
-        for user_content in instance["turns"]:
-            messages.append({"role": "user", "content": user_content})
-            input_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
-
-            response = {}
-            for bs in [1, block_size]:
-                response[bs] = dflash_generate(
-                    model=draft_model,
-                    target=target,
-                    input_ids=input_ids,
-                    mask_token_id=draft_model.mask_token_id,
-                    max_new_tokens=args.max_new_tokens,
-                    block_size=bs,
-                    stop_token_ids=[tokenizer.eos_token_id],
-                    sample_fn=sample_fn,
-                    extract_context_feature_fn=extract_context_feature_fn,
-                    temperature=args.temperature,
+    with ExitStack() as stack:
+        trace_writer = None
+        if args.trace_output is not None:
+            trace_writer = stack.enter_context(
+                VerificationTraceWriter(
+                    args.trace_output,
+                    rank=_dist_rank(),
+                    world_size=_dist_size(),
+                    metadata={
+                        "trace_schema_version": 1,
+                        "dataset": args.dataset,
+                        "max_samples": args.max_samples,
+                        "num_samples": len(dataset),
+                        "max_new_tokens": args.max_new_tokens,
+                        "temperature": args.temperature,
+                        "seed": 0,
+                        "draft_arch": args.draft_arch,
+                        "block_size": block_size,
+                        "target_layer_ids": draft_model.target_layer_ids,
+                        "model_name_or_path": args.model_name_or_path,
+                        "draft_name_or_path": args.draft_name_or_path,
+                        "trace_prob_stats": args.trace_prob_stats,
+                        "probability_distribution": "raw_logits_softmax",
+                    },
                 )
+            )
+        for idx in tqdm(indices, disable=not _dist_is_main()):
+            instance = dataset[idx]
+            messages = []
+            for turn_id, user_content in enumerate(instance["turns"]):
+                messages.append({"role": "user", "content": user_content})
+                input_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
+                input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
-            spec_response = response[block_size]
-            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens :]
-            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            messages.append({"role": "assistant", "content": output_text})
-            responses.append(response)
+                response = {}
+                for bs in [1, block_size]:
+                    response[bs] = dflash_generate(
+                        model=draft_model,
+                        target=target,
+                        input_ids=input_ids,
+                        mask_token_id=draft_model.mask_token_id,
+                        max_new_tokens=args.max_new_tokens,
+                        block_size=bs,
+                        stop_token_ids=[tokenizer.eos_token_id],
+                        sample_fn=sample_fn,
+                        extract_context_feature_fn=extract_context_feature_fn,
+                        temperature=args.temperature,
+                        trace_writer=trace_writer if bs > 1 else None,
+                        trace_context=(
+                            {"sample_id": idx, "turn_id": turn_id}
+                            if trace_writer is not None and bs > 1
+                            else None
+                        ),
+                        trace_prob_stats=args.trace_prob_stats,
+                    )
+
+                spec_response = response[block_size]
+                generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens :]
+                output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                messages.append({"role": "assistant", "content": output_text})
+                responses.append(response)
 
     if _dist_size() > 1:
         gathered = _dist_gather(responses, dst=0)

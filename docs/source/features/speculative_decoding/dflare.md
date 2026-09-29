@@ -53,7 +53,7 @@ Both entries use the same defaults: `block_size=16`, `num_anchors=512`, `lr=6e-4
 
 ### Inference and Evaluation
 
-To benchmark a trained DFlare draft model on tasks such as GSM8K, MT-Bench, MATH-500, and HumanEval, use `tools/dflash_benchmark.py`. The script supports both DFlash and DFlare draft architectures via the `--draft-arch` flag — for DFlare set `--draft-arch dflare`. It loads the matching `QwenDFlareDraftModel` class, runs block-parallel speculative decoding (block-size proposal from the draft + parallel target verification + longest-prefix accept), and reports decoding speedup, average acceptance length, and the per-block acceptance-length histogram.
+To benchmark a trained DFlare draft model on tasks such as GSM8K, MT-Bench, MATH-500, and HumanEval, use `tools/dflash_benchmark.py`. The script supports both DFlash and DFlare draft architectures via the `--draft-arch` flag — for DFlare set `--draft-arch dflare`. It loads the matching `QwenDFlareDraftModel` class, runs block-parallel speculative decoding (one existing anchor token plus `block_size - 1` draft proposals, parallel target verification, and longest-prefix acceptance), and reports decoding speedup, average acceptance length, and the per-block acceptance-length histogram.
 
 **Single-GPU evaluation:**
 
@@ -91,6 +91,36 @@ Notes:
 - Both target and draft are loaded in `bfloat16` with `flash_attention_2` when `flash-attn` is installed (otherwise it falls back to PyTorch SDPA, which reduces wall-clock speedup but does not affect acceptance length).
 - Supported datasets out of the box: `gsm8k`, `math500`, `aime24`, `aime25`, `alpaca`, `mt-bench`, `humaneval`, `mbpp`, `lbpp`, `swe-bench`, `livecodebench`.
 - To compare DFlash and DFlare on the same checkpoint format, switch `--draft-arch dflash` and point `--draft-name-or-path` to a DFlash checkpoint — the rest of the command stays identical.
+
+### Optional Verification Trace
+
+Add `--trace-output /path/to/verification.jsonl` to either evaluation command to stream one JSON object per speculative round. Add `--trace-prob-stats` to also record per-proposal probabilities and entropies. Tracing is disabled by default: without `--trace-output`, no trace files or extra probability calculations are produced, and `--trace-prob-stats` has no effect. The `block_size=1` AR baseline is never traced.
+
+For a verified block of size `B`, position 0 is an already sampled anchor; the drafter greedily proposes the remaining `B - 1` tokens. Target verification samples one token from each target output position using the CLI temperature (argmax at temperature 0), and acceptance takes the longest matching proposal prefix. The draft remains greedy even when the CLI temperature is nonzero. The trace uses the tensors from these existing forwards and records the following fields:
+
+| Fields | Meaning |
+| --- | --- |
+| `sample_id`, `turn_id`, `round_id` | Zero-based sample index after the benchmark's optional shuffle/select, before rank sharding; turn index within that sample; round index reset to 0 for each generation call. |
+| `num_input_tokens`, `round_start`, `generated_tokens_before_round` | Prompt length; absolute token index of the current anchor; `round_start - num_input_tokens`, counting generated tokens before the anchor and excluding the anchor itself. |
+| `block_size`, `proposal_count` | `B` and `B - 1`. |
+| `anchor_token_id`, `draft_token_ids` | The anchor at block position 0 and the `B - 1` draft proposal IDs at positions 1 through `B - 1`. |
+| `target_token_ids_for_proposals`, `match_mask` | Target verification IDs from `posterior[:, :-1]` and their elementwise equality with the draft proposals. All proposal positions are included, even after the first rejection. |
+| `accepted_draft_tokens`, `reported_acceptance_length` | Longest matching proposal prefix length `A`; the existing benchmark metric `A + 1`, which includes the anchor. |
+| `first_reject_position`, `all_draft_tokens_accepted` | Zero-based proposal index `A` of the first rejection, or JSON `null` if all proposals match; whether `A == B - 1`. |
+
+With `--trace-prob-stats`, each record also contains five arrays of length `B - 1`:
+
+- `draft_logprobs[k] = log q_D(x_k)` and `target_logprobs[k] = log p_T(x_k)`, both evaluated at the token `x_k` actually proposed by the drafter.
+- `logprob_gaps[k] = target_logprobs[k] - draft_logprobs[k]`.
+- `draft_entropies[k]` and `target_entropies[k]`, computed over each position's complete vocabulary distribution.
+
+Proposal `x_k = block_output_ids[:, k + 1]` aligns with `draft_logits[:, k]` and `output.logits[:, k]`; the corresponding target verification token is `posterior[:, k]`. In particular, `target_logprobs` gathers the proposed token's probability, even when it differs from the target verification token. Target tokens and logits after the first rejection still condition on the original draft proposal prefix from the same causal verification forward; they do not represent a corrected AR continuation. Statistics use FP32 log-softmax of the **raw, unscaled model logits**, natural logarithms, and entropy in nats, regardless of sampling temperature. Reductions stay on the device; only token IDs and per-position scalar statistics are written. Full logits, hidden states, and KV caches are not saved.
+
+Each record describes the complete verified block before EOS or output-length truncation. Thus acceptance fields preserve the benchmark's per-round metric even when the returned generation ends partway through the final block.
+
+On a single GPU, the writer uses the requested path directly. Under `torchrun`, `verification.jsonl` becomes `verification.rank0.jsonl`, `verification.rank1.jsonl`, and so on. Parent directories are created automatically; each JSONL line is flushed through line buffering. A companion `<resolved-trace-path>.meta.json` records benchmark settings, model paths, block size, target layer IDs, probability-statistics setting, rank, and world size.
+
+Trace collection adds device-to-host transfers and file writes inside the timed decoding loop, with additional computation when probability statistics are enabled. Use runs with tracing disabled for baseline speed comparisons. Tracing does not change sampling, acceptance, cache updates, target-layer fusion, or generation output.
 
 
 ## 📈 Results
