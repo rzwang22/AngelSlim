@@ -214,6 +214,66 @@ All analysis uses accepted draft tokens, excluding the anchor. With `A[r,c]` den
 
 These are measurements on the selected canonical states, not throughput predictions or a rollout of a dynamic policy. State capture adds overhead, and replay repeats prior original rounds for every state and candidate, so it can be much slower than ordinary generation. Without the P3 flags, the existing P1/P2 benchmark paths remain unchanged.
 
+### Previous-Verification Predictability Analysis
+
+P4 constructs an offline dataset linking previous verification feedback to the next canonical state's route outcomes. It consumes existing P1 and P3 files and changes no inference or routing code:
+
+```shell
+python tools/analyze_verification_route_predictability.py \
+    --trace experiments/traces/gsm8k_8.jsonl \
+    --oracle experiments/oracle/gsm8k_8_oracle_all.jsonl \
+    --output-dir experiments/predictability/gsm8k_8
+```
+
+Use a fresh output directory: existing generated artifacts are not overwritten. Both `--trace` and `--oracle` accept multiple files, including rank shards; state keys must remain unique across files. P4 expects all six predefined routes in every oracle record. Add `--run-predictors` when creating a new analysis run to enable the optional baselines.
+
+For each oracle key `(sample_id, turn_id, round_id=r)`, the tool first validates the matching **current** P1 record against the canonical acceptance, original-route proposal IDs, target verification IDs when available, and comparable prefix fields. In the current P3 schema, `prefix_length` includes the anchor and therefore equals P1 `round_start + 1`; canonical draft IDs are available through `route_results.original.draft_token_ids`. It then obtains verification predictors exclusively from `(sample_id, turn_id, r-1)`. It never joins across requests or turns or substitutes the nearest available round. Missing records, duplicate keys, or inconsistent trajectories abort analysis before outputs are written. Round 0 is validated before exclusion because it has no previous verification. Existing oracle metadata must mark replay complete with zero mismatches, and shared provenance fields must agree across inputs. Missing sidecars produce an explicit warning that provenance checks are limited.
+
+The aligned CSV separates identity, decision-time context, previous verification, and current labels. Its predictor vocabulary is explicit:
+
+| Feature family | Columns |
+| --- | --- |
+| Current context | `current_prefix_length`, `current_round_id`, `current_generated_tokens_before_round`, `current_generated_tokens_before_round_available` |
+| Previous acceptance/rejection | `prev_accepted_draft_tokens`, `prev_reported_acceptance_length`, `prev_acceptance_fraction`, `prev_first_reject_position`, `prev_first_reject_fraction`, `prev_all_draft_tokens_accepted`, `prev_proposal_count` |
+| Previous logprob gaps | `prev_gap_mean`, `prev_gap_std`, `prev_gap_min`, `prev_gap_max`, `prev_gap_at_first_reject`, `prev_gap_accepted_prefix_mean`, `prev_gap_post_reject_mean` |
+| Previous target entropy | `prev_target_entropy_mean`, `prev_target_entropy_std`, `prev_target_entropy_min`, `prev_target_entropy_max`, `prev_target_entropy_at_first_reject` |
+| Previous draft entropy | `prev_draft_entropy_mean`, `prev_draft_entropy_std`, `prev_draft_entropy_min`, `prev_draft_entropy_max`, `prev_draft_entropy_at_first_reject` |
+| Previous gap magnitude | `prev_abs_gap_mean`, `prev_large_negative_gap_fraction` |
+
+Acceptance and rejection fractions divide by the previous proposal count. Standard deviations use the population definition. If the previous round accepted `A` proposals, accepted-prefix statistics use positions `[:A]`, and post-rejection statistics use `[A:]`, including the rejected position. An all-accepted round has no rejection position or post-rejection region; a zero-acceptance round has no accepted-prefix region. Undefined features use `NaN` in CSV and `null` in JSON. Both rejection-position features and every probability/magnitude feature have a corresponding `<feature>_available` indicator; the optional generated-token count has its indicator listed above. Missing probability arrays do not prevent basic analysis; their features remain unavailable and a coverage notice is reported. `--large-gap-threshold` defines the fraction with `gap < threshold`, defaulting to `-2.0`.
+
+`PREDICTOR_COLUMNS`, `LABEL_COLUMNS`, and named feature groups make the temporal separation inspectable:
+
+| Group | Included predictors |
+| --- | --- |
+| `context_only` | The four current-context columns above. |
+| `accept_only` | `prev_accepted_draft_tokens`, `prev_acceptance_fraction`, `prev_all_draft_tokens_accepted`. |
+| `accept_reject` | `accept_only` plus both rejection-position features and their availability indicators. |
+| `verification_probability` | `accept_reject` plus all gap, entropy, magnitude, and associated availability features. |
+| `verification_full` | Every previous-verification feature, additionally including `prev_reported_acceptance_length` and `prev_proposal_count`. |
+| `context_plus_verification` | `context_only` plus `verification_full`. |
+
+Context features describe the known current position; verification groups use only the previous round. The combined group allows comparison against the context baseline. Current verification results, current token IDs, acceptance labels, oracle gains, and identity columns are never predictor inputs.
+
+Labels come only from current `route_results`: `accept_<route>`, restricted-route `gain_<route> = accept_<route> - accept_original`, `oracle_accept = max_route accept_<route>`, and `oracle_gain = oracle_accept - accept_original`. `best_route_set` retains every tied maximizer. Binary outcomes include any restricted route beating original or matching-or-beating it, plus `deep`/`mid_deep` beating, exactly matching, matching-or-beating, or being within one token of original. Here “within one” means acceptance at least `accept_original - 1`, including larger gains.
+
+Descriptive outputs are:
+
+- `aligned_verification_route_dataset.csv`: one row per usable current state, with `prev_round_id` and availability indicators.
+- `summary.json`: alignment/exclusion counts, feature groups, coverage, and overall routing outcomes.
+- `bucket_by_prev_acceptance.csv`: bins `0–2`, `3–5`, `6–9`, `10–14`, `15`, and `16+`.
+- `bucket_by_prev_reject_position.csv`: early positions `0–3`, middle `4–8`, late `9+`, and all accepted.
+- `feature_correlations.csv`: Pearson and Spearman associations of numeric previous-verification features with `oracle_gain`, `gain_deep`, and `gain_mid_deep`, sorted by absolute Spearman correlation.
+- `report.txt`: the same human-readable summary printed to the console.
+
+Each bucket reports its sample count, restricted-route win rate, mean oracle/deep/mid-deep gains, and deep/mid-deep matching-or-beating rates. Correlations use available value pairs; undefined correlations are kept missing. These descriptive associations are not causal evidence.
+
+Optional predictive baselines run with `--run-predictors` and require scikit-learn only in the analysis environment; it is not an AngelSlim runtime dependency. They compare a training-fold base rate, logistic regression, and a depth-3 decision tree across feature groups. Validation requires at least two request groups and leaves out an entire `sample_id` at a time, keeping all turns and rounds of a request together. Median imputation, missing indicators, and mean/std scaling are fit only on training requests; an entirely missing training column uses zero plus its missing indicator. Single-class training folds use their constant base rate. Single-class test folds have undefined classification metrics and are counted explicitly. `prediction_metrics.csv` reports equal-request fold means separately from metrics pooled over all held-out states; PR-AUC is trapezoidal area under the precision-recall curve. `oof_predictions.csv` records individual held-out predictions for inspection.
+
+`policy_metrics.csv` uses held-out predictions for binary `original` versus `deep` and `original` versus `mid_deep` choices. It compares selected counterfactual acceptance with always-original, always-deep, always-mid-deep, each binary oracle, and the full route oracle on the same states. Captured oracle gain is `(policy_mean - original_mean) / (full_oracle_mean - original_mean)`; negative gains remain negative, and a zero denominator is undefined. These policies are scored on canonical original-history states, not rolled out to create new trajectories.
+
+Predictive results are marked `PRELIMINARY` with the number of independent request groups; eight requests remain eight groups even if they contain hundreds of rounds. The supplied 301-state server results are motivation for this analysis, not results reproduced by these tools or by local synthetic tests.
+
 
 ## 📈 Results
 
